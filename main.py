@@ -20,12 +20,14 @@ from torch.utils.data.dataloader import default_collate
 from torch.utils.tensorboard import SummaryWriter
 
 from robust_loss_pytorch import AdaptiveLossFunction
+from nfnets.agc import AGC
 
 from pyproj import Proj, transform
 
 from simple_parsing import Serializable
 from file_cache import pickle_file_cache
 from with_args import with_args
+from bayes_gru import BayesGRU
 
 tqdm.pandas()
 
@@ -135,6 +137,16 @@ class SliceInterval(object):
         return x[i0:i0 + self.seq_len]
 
 
+#class RandomSE2Transform(object):
+#    def __init__(self):
+#        pass
+#
+#    def __call__(self, x):
+#        # x = T x 2
+#        h = -np.pi + (2 * np.pi) * th.rand()
+#        c, s = th.cos(h), th.sin(h)
+
+
 @dataclass
 class Settings(Serializable):
     input_size: int = 2  # x, y
@@ -142,7 +154,7 @@ class Settings(Serializable):
     latent_size: int = 128
     output_size: int = 2  # x, y
     num_layers: int = 2
-    sequence_length: int = 8
+    sequence_length: int = 16
     min_noise: float = 0.0  # i guess this is like 0m
     max_noise: float = 0.1  # i guess this is like 100m
     num_epochs: int = 16
@@ -154,6 +166,9 @@ class Settings(Serializable):
     train: bool = True
     load_file: str = ''
     learning_rate: float = 1e-3
+    use_adaptive_loss: bool = True
+    use_agc: bool = False  # clearly does not work
+    use_bayes_gru: bool = False
 
 
 class RnnFilter(nn.Module):
@@ -165,12 +180,19 @@ class RnnFilter(nn.Module):
         # self.feat = nn.Linear(opts.input_size, opts.latent_size)
 
         # rnn part
-        self.rnn = nn.GRU(
-            opts.input_size,
-            opts.latent_size,
-            opts.num_layers,
-            True,
-            True)
+        if opts.use_bayes_gru:
+            self.rnn = BayesGRU(
+                opts.input_size,
+                opts.latent_size,
+                opts.num_layers,
+                batch_first=True)
+        else:
+            self.rnn = nn.GRU(
+                opts.input_size,
+                opts.latent_size,
+                opts.num_layers,
+                bias=True,
+                batch_first=True)
         # final output
         self.out = nn.Linear(opts.latent_size, opts.output_size, True)
 
@@ -185,7 +207,17 @@ class RnnFilter(nn.Module):
             self.opts.num_layers,
             batch_size,
             self.opts.latent_size).zero_()
-        return hidden
+
+        if self.opts.use_bayes_gru:
+            # initializes to var == 256
+            # generally should get very close to initial value.
+            log_std = weight.new_full(
+                (self.opts.num_layers,
+                 batch_size,
+                 self.opts.latent_size), 4.0)
+            return (hidden, log_std)
+        else:
+            return hidden
 
     def forward(self, x, h):
         # map to feature
@@ -282,25 +314,34 @@ def main(args: Settings):
         args.dataset,
         transform=SliceInterval(
             args.sequence_length))
-    print('len = {}'.format(len(dataset)))
     loader = DataLoader(dataset, args.batch_size, True, num_workers=8,
                         collate_fn=_skip_none)
 
     # == train config ==
-    # loss_fn = nn.MSELoss()
-    loss_obj = AdaptiveLossFunction(
-        num_dims=args.output_size,
-        float_dtype=th.float32, device=device)
-    def loss_fn(output, target):
-        loss = th.mean(
-            loss_obj.lossfun(
-                output.reshape(-1, 2) - target.reshape(-1, 2)
-            )
-        )
-        return loss
+    if args.use_adaptive_loss:
+        loss_obj = AdaptiveLossFunction(
+            num_dims=args.output_size,
+            float_dtype=th.float32, device=device)
 
-    params = list(model.parameters()) + list(loss_obj.parameters())
-    optimizer = optim.Adam(params, lr=args.learning_rate)
+        def loss_fn(output, target):
+            loss = th.mean(
+                loss_obj.lossfun(
+                    output.reshape(-1, 2) - target.reshape(-1, 2)
+                )
+            )
+            return loss
+        params = list(model.parameters()) + list(loss_obj.parameters())
+    else:
+        loss_fn = nn.MSELoss()
+        params = model.parameters()
+
+    if args.use_agc:
+        # GASP! AGC!?!?
+        # optimizer = optim.Adam(params, lr=args.learning_rate)
+        optimizer = optim.SGD(params, lr=args.learning_rate)
+        optimizer = AGC(params, optimizer)
+    else:
+        optimizer = optim.Adam(params, lr=args.learning_rate)
 
     # == logging ==
     if args.train:
@@ -321,20 +362,38 @@ def main(args: Settings):
                  args.latent_size),
                 dtype=th.float32,
                 device=device)
-            writer.add_graph(model, (dummy_x, dummy_h))
+
+            if args.use_bayes_gru:
+                dummy_ls = th.zeros(
+                    (args.num_layers,
+                     args.batch_size,
+                     args.latent_size),
+                    dtype=th.float32,
+                    device=device)
+                writer.add_graph(model, (dummy_x, (dummy_h, dummy_ls)))
+            else:
+                writer.add_graph(model, (dummy_x, dummy_h))
 
     # == train ==
     try:
         step = 0
         for epoch in range(args.num_epochs):
             net_loss = 0.0
+            net_raw_error = 0.0
+            net_filtered_error = 0.0
             for i, sample in tqdm(enumerate(loader)):
                 step += 1
                 # Preprocess sample to be in a decent scale.
                 sample = (sample / 1000.0).to(device)
 
                 bs = len(sample)
-                h = model.init_hidden(bs).to(device)
+                if args.use_bayes_gru:
+                    h, ls = model.init_hidden(bs)
+                    h = h.to(device)
+                    ls = ls.to(device)
+                    h = (h, ls)  # << group together, ... just for convenience
+                else:
+                    h = model.init_hidden(bs).to(device)
 
                 # Create noisy sample ...
                 # TODO(ycho): Maybe some samples need to be *not* noisy?
@@ -349,19 +408,38 @@ def main(args: Settings):
                 # Prediction + train
                 if args.train:
                     out, _ = model(x, h)
+                    # only compute loss on latter half
+                    # T = args.sequence_length // 2
+                    # loss = loss_fn(out[:, -T:], sample[:, -T:])
                     loss = loss_fn(out, sample)
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
 
-                    net_loss += loss / args.log_period
+                    # if args.log_metrics:
+                    if True:
+                        net_loss += loss / args.log_period
+                        net_raw_error += th.sqrt(th.square(x - sample).mean()
+                                                 ) / args.log_period
+                        net_filtered_error += th.sqrt(
+                            th.square(out - sample).mean()) / args.log_period
 
                     # Log
                     if (i > 0) and (i % args.log_period) == 0:
                         print('net loss = {}'.format(net_loss))
                         writer.add_scalar(
                             'loss', net_loss, global_step=step)
+                        writer.add_scalar(
+                            'net_raw_error', net_raw_error, global_step=step)
+                        writer.add_scalar(
+                            'net_filtered_error',
+                            net_filtered_error,
+                            global_step=step)
+
+                        # y'know, all this should really be a callback ...
                         net_loss = 0.0
+                        net_raw_error = 0.0
+                        net_filtered_error = 0.0
 
                     # Save
                     if (i > 0) and (i % args.save_period == 0):
